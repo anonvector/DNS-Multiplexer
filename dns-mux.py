@@ -498,7 +498,14 @@ class DNSMultiplexer:
             return
 
         logging.info(f"Using {len(working)}/{len(self.pool.resolvers)} working resolvers")
-        self.pool = ResolverPool(working, mode=self.pool.mode, doh=self.pool.doh)
+        new_pool = ResolverPool(working, mode=self.pool.mode, doh=self.pool.doh)
+        self.pool = new_pool
+        # Propagate to proxies so they use the filtered pool
+        self.udp.pool = new_pool
+        if self.tcp:
+            self.tcp.pool = new_pool
+        if self.cover:
+            self.cover.pool = new_pool
 
     def start(self):
         mode_str = "DoH (HTTPS)" if self.doh_mode else "UDP"
