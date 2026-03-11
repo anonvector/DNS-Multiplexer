@@ -43,6 +43,13 @@ COVER_MIN=5
 COVER_MAX=15
 ALSO_DEPLOY_DNSTT=false
 ENABLE_DOH=false
+ENABLE_TUNNEL=false
+TUNNEL_PROFILE=""
+TUNNEL_LISTEN="0.0.0.0:1080"
+SCAN_INTERVAL="5m"
+SCAN_TOP=20
+SCAN_WORKERS=200
+SCAN_MIN_SCORE=3
 
 # CLI flags
 AUTO_MODE=false
@@ -89,6 +96,13 @@ parse_args() {
             --mode|-m)      shift; MODE="$1" ;;
             --doh)          ENABLE_DOH=true ;;
             --with-dnstt)   ALSO_DEPLOY_DNSTT=true ;;
+            --tunnel)       ENABLE_TUNNEL=true ;;
+            --profile)      shift; TUNNEL_PROFILE="$1" ;;
+            --tunnel-listen) shift; TUNNEL_LISTEN="$1" ;;
+            --scan-interval) shift; SCAN_INTERVAL="$1" ;;
+            --scan-top)     shift; SCAN_TOP="$1" ;;
+            --scan-workers) shift; SCAN_WORKERS="$1" ;;
+            --scan-min-score) shift; SCAN_MIN_SCORE="$1" ;;
             --help|-h)
                 echo "Usage: dns-mux [COMMAND] [OPTIONS]"
                 echo ""
@@ -112,6 +126,15 @@ parse_args() {
                 echo "  --with-dnstt       Also deploy dnstt-server (uses bundled binaries)"
                 echo "  --uninstall, -u    Remove dns-multiplexer"
                 echo "  --help, -h         Show this help"
+                echo ""
+                echo "Tunnel mode (integrated dnstt/noizdns client):"
+                echo "  --tunnel                 Enable tunnel mode"
+                echo "  --profile URI_OR_FILE    slipnet:// config URI or file path"
+                echo "  --tunnel-listen ADDR     SOCKS5 listen address (default: 0.0.0.0:1080)"
+                echo "  --scan-interval DUR      Re-scan interval (default: 5m)"
+                echo "  --scan-top N             Keep top N resolvers (default: 20)"
+                echo "  --scan-workers N         Concurrent scan workers (default: 200)"
+                echo "  --scan-min-score N       Min score 0-6 (default: 3)"
                 exit 0
                 ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
@@ -236,23 +259,48 @@ configure_firewall() {
 # ─── Installation ────────────────────────────────────────────────────────────
 
 install_proxy() {
-    print_header "Installing DNS Multiplexer Proxy"
+    print_header "Installing DNS Multiplexer"
 
     # Create directories
     mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 
-    # Install proxy script (local copy or download from repo)
-    if [[ -f "$SCRIPT_DIR/$PROXY_SCRIPT" ]]; then
-        cp "$SCRIPT_DIR/$PROXY_SCRIPT" "$INSTALL_DIR/$PROXY_SCRIPT"
+    detect_arch
+
+    # Install Go binary
+    GO_BINARY="dns-multiplexer-$BINARY_SUFFIX"
+    if [[ -f "$SCRIPT_DIR/bin/$GO_BINARY" ]]; then
+        cp "$SCRIPT_DIR/bin/$GO_BINARY" "$INSTALL_DIR/dns-multiplexer"
     else
-        print_status "Downloading $PROXY_SCRIPT from repository..."
-        curl -fsSL "$REPO_RAW_URL/$PROXY_SCRIPT" -o "$INSTALL_DIR/$PROXY_SCRIPT" || {
-            print_error "Failed to download $PROXY_SCRIPT"
+        print_status "Downloading $GO_BINARY from repository..."
+        curl -fsSL "$REPO_RAW_URL/bin/$GO_BINARY" -o "$INSTALL_DIR/dns-multiplexer" || {
+            print_error "Failed to download $GO_BINARY"
             exit 1
         }
     fi
-    chmod +x "$INSTALL_DIR/$PROXY_SCRIPT"
-    print_status "Installed proxy: $INSTALL_DIR/$PROXY_SCRIPT"
+    chmod +x "$INSTALL_DIR/dns-multiplexer"
+    print_status "Installed: $INSTALL_DIR/dns-multiplexer"
+
+    # Install slipnet CLI if tunnel mode
+    if [[ "$ENABLE_TUNNEL" == "true" ]]; then
+        SLIPNET_BINARY="slipnet-$BINARY_SUFFIX"
+        if [[ -f "$SCRIPT_DIR/bin/$SLIPNET_BINARY" ]]; then
+            cp "$SCRIPT_DIR/bin/$SLIPNET_BINARY" "$INSTALL_DIR/slipnet"
+        else
+            print_status "Downloading $SLIPNET_BINARY from repository..."
+            curl -fsSL "$REPO_RAW_URL/bin/$SLIPNET_BINARY" -o "$INSTALL_DIR/slipnet" || {
+                print_error "Failed to download $SLIPNET_BINARY"
+                exit 1
+            }
+        fi
+        chmod +x "$INSTALL_DIR/slipnet"
+        print_status "Installed: $INSTALL_DIR/slipnet"
+    fi
+
+    # Also install legacy Python proxy if present
+    if [[ -f "$SCRIPT_DIR/$PROXY_SCRIPT" ]]; then
+        cp "$SCRIPT_DIR/$PROXY_SCRIPT" "$INSTALL_DIR/$PROXY_SCRIPT"
+        chmod +x "$INSTALL_DIR/$PROXY_SCRIPT"
+    fi
 
     # Install resolvers file (local copy, download, or generate default)
     if [[ -f "$SCRIPT_DIR/$RESOLVERS_FILE" ]]; then
@@ -354,21 +402,18 @@ create_service() {
     print_header "Creating systemd service"
 
     # Build command line arguments
-    EXEC_ARGS="$INSTALL_DIR/$PROXY_SCRIPT"
+    EXEC_ARGS="$INSTALL_DIR/dns-multiplexer"
     EXEC_ARGS+=" --listen $LISTEN_ADDR:$LISTEN_PORT"
     EXEC_ARGS+=" --mode $MODE"
 
     if [[ "$ENABLE_DOH" == "true" ]]; then
         EXEC_ARGS+=" --doh"
-        # Only pass resolvers file if it contains DoH URLs, not bare IPs
         if grep -q "^https://" "$CONFIG_DIR/$RESOLVERS_FILE" 2>/dev/null; then
             EXEC_ARGS+=" --resolvers-file $CONFIG_DIR/$RESOLVERS_FILE"
         fi
-        # Otherwise falls back to built-in DoH resolvers (dns.google, cloudflare, quad9, etc.)
     else
         EXEC_ARGS+=" --resolvers-file $CONFIG_DIR/$RESOLVERS_FILE"
     fi
-    # auto-select is now on by default, no flag needed
     if [[ "$ENABLE_TCP" == "true" ]]; then
         EXEC_ARGS+=" --tcp"
     fi
@@ -382,16 +427,37 @@ create_service() {
         EXEC_ARGS+=" --stats"
     fi
 
+    # Tunnel mode flags
+    if [[ "$ENABLE_TUNNEL" == "true" ]]; then
+        EXEC_ARGS+=" --tunnel"
+        EXEC_ARGS+=" --tunnel-listen $TUNNEL_LISTEN"
+        EXEC_ARGS+=" --scan-interval $SCAN_INTERVAL"
+        EXEC_ARGS+=" --scan-top $SCAN_TOP"
+        EXEC_ARGS+=" --scan-workers $SCAN_WORKERS"
+        EXEC_ARGS+=" --scan-min-score $SCAN_MIN_SCORE"
+        if [[ -n "$TUNNEL_PROFILE" ]]; then
+            # If it's a URI, save to file for the service
+            if [[ "$TUNNEL_PROFILE" == slipnet://* ]]; then
+                echo "$TUNNEL_PROFILE" > "$CONFIG_DIR/profile.conf"
+                EXEC_ARGS+=" --tunnel-profile $CONFIG_DIR/profile.conf"
+            else
+                EXEC_ARGS+=" --tunnel-profile $TUNNEL_PROFILE"
+            fi
+        fi
+    fi
+
+    EXEC_ARGS+=" --cache"
+
     cat > "$SYSTEMD_DIR/$SERVICE_NAME.service" << EOF
 [Unit]
-Description=DNS Multiplexer Proxy
-Documentation=https://github.com/anonvector/SlipNet
+Description=DNS Multiplexer${ENABLE_TUNNEL:+ (Tunnel Mode)}
+Documentation=https://github.com/anonvector/DNS-Multiplexer
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PYTHON_BIN $EXEC_ARGS
+ExecStart=$EXEC_ARGS
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=300
@@ -530,6 +596,8 @@ uninstall() {
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$SYSTEMD_DIR/$SERVICE_NAME.service"
     rm -f "$INSTALL_DIR/$PROXY_SCRIPT"
+    rm -f "$INSTALL_DIR/dns-multiplexer"
+    rm -f "$INSTALL_DIR/slipnet"
     rm -f "$SELF_INSTALL_PATH"
 
     # Also clean up dnstt-server if it was deployed alongside
@@ -729,7 +797,6 @@ main() {
     fi
 
     detect_os
-    check_python3
 
     if [[ "$AUTO_MODE" != "true" ]]; then
         interactive_config
