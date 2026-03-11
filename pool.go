@@ -235,6 +235,29 @@ func ProbeResolvers(pool *ResolverPool) []Resolver {
 	return working
 }
 
+// UpdateResolvers replaces the active resolver list with the given ordered
+// resolvers. Stats are preserved for existing resolvers and initialized for
+// new ones. Used by AutoScanner to prioritize the best resolvers.
+func (p *ResolverPool) UpdateResolvers(ordered []Resolver) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.resolvers = ordered
+
+	for _, r := range ordered {
+		if _, ok := p.stats[r]; !ok {
+			p.stats[r] = &resolverStats{}
+			p.failStreak[r] = 0
+		}
+		if _, ok := p.healthy[r]; !ok {
+			p.healthy[r] = true
+		}
+	}
+
+	p.rebuildHealthyCache()
+	slog.Info("Resolver pool updated", "count", len(ordered))
+}
+
 // PoolWithTimeout returns a duration used for health-check & stats loops.
 const (
 	HealthCheckInterval = 30 * time.Second

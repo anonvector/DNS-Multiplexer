@@ -262,6 +262,36 @@ func isTimeout(err error) bool {
 	return strings.Contains(err.Error(), "timeout")
 }
 
+// scanResolversQuiet scans resolvers without terminal output. Used by AutoScanner.
+func scanResolversQuiet(resolvers []Resolver, testDomain string, doh bool, workers int) []ScanResult {
+	sendFn := scanSendFn(doh)
+
+	var (
+		mu      sync.Mutex
+		results []ScanResult
+		wg      sync.WaitGroup
+	)
+
+	sem := make(chan struct{}, workers)
+	for _, r := range resolvers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r Resolver) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			result := scanResolver(r, testDomain, sendFn)
+			mu.Lock()
+			results = append(results, result)
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+
+	return results
+}
+
 func runScan(resolvers []Resolver, testDomain string, doh bool, workers int) []ScanResult {
 	sendFn := scanSendFn(doh)
 

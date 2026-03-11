@@ -52,6 +52,19 @@ func main() {
 		logLevel     string
 		cacheEnabled bool
 		cacheSize    int
+
+		// Tunnel mode flags
+		tunnel        bool
+		tunnelType    string
+		tunnelDomain  string
+		tunnelPubkey  string
+		tunnelListen  string
+		tunnelBinary  string
+		tunnelProfile string
+		scanInterval  string
+		scanMinScore  int
+		scanTop       int
+		scanWorkers   int
 	)
 
 	flag.StringVar(&listen, "listen", "0.0.0.0:53", "Listen address:port")
@@ -76,6 +89,19 @@ func main() {
 	flag.BoolVar(&cacheEnabled, "cache", false, "Enable DNS response cache")
 	flag.IntVar(&cacheSize, "cache-size", 10000, "Max cache entries")
 
+	// Tunnel mode
+	flag.BoolVar(&tunnel, "tunnel", false, "Enable tunnel mode: manage a dnstt/noizdns client with auto-scanning")
+	flag.StringVar(&tunnelType, "tunnel-type", "dnstt", "Tunnel type: dnstt or noizdns")
+	flag.StringVar(&tunnelDomain, "tunnel-domain", "", "Tunnel domain (e.g. t.example.com)")
+	flag.StringVar(&tunnelPubkey, "tunnel-pubkey", "", "Server public key (hex)")
+	flag.StringVar(&tunnelListen, "tunnel-listen", "0.0.0.0:1080", "SOCKS5 listen address for users")
+	flag.StringVar(&tunnelBinary, "tunnel-binary", "slipnet", "Path to slipnet binary")
+	flag.StringVar(&tunnelProfile, "tunnel-profile", "", "slipnet:// URI or path to file containing one")
+	flag.StringVar(&scanInterval, "scan-interval", "5m", "Auto-scan interval (e.g. 5m, 10m, 1h)")
+	flag.IntVar(&scanMinScore, "scan-min-score", 3, "Minimum tunnel compatibility score (0-6) for a resolver to be used")
+	flag.IntVar(&scanTop, "scan-top", 20, "Keep top N resolvers in active pool (0 = keep all qualifying)")
+	flag.IntVar(&scanWorkers, "scan-workers", 200, "Concurrent workers for resolver scanning")
+
 	flag.Parse()
 
 	// Configure logging
@@ -95,7 +121,7 @@ func main() {
 	// Parse resolvers
 	parsed := parseResolvers(resolverFile, resolvers, doh)
 
-	// Scan mode
+	// Scan mode (one-shot)
 	if scan {
 		if scanDomain == "" {
 			fmt.Fprintln(os.Stderr, "Error: --scan requires --scan-domain (e.g. --scan-domain t.example.com)")
@@ -115,7 +141,17 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Proxy mode
+	// Tunnel mode
+	if tunnel {
+		runTunnelMode(parsed, doh, mode, listen, tcp, cacheEnabled, cacheSize,
+			cover, coverMin, coverMax, healthCheck, stats,
+			tunnelType, tunnelDomain, tunnelPubkey, tunnelListen,
+			tunnelBinary, tunnelProfile, scanDomain, scanInterval,
+			scanMinScore, scanTop, scanWorkers)
+		return
+	}
+
+	// Standard proxy mode
 	if len(parsed) == 0 {
 		if doh {
 			slog.Info("No resolvers specified, using default DoH resolvers")
@@ -210,6 +246,211 @@ func main() {
 	<-sig
 
 	slog.Info("Shutting down...")
+	udp.Stop()
+	if tcpProxy != nil {
+		tcpProxy.Stop()
+	}
+	if coverTraffic != nil {
+		coverTraffic.Stop()
+	}
+}
+
+func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheEnabled bool, cacheSize int,
+	cover bool, coverMin, coverMax float64, healthCheck, stats bool,
+	tunnelType, tunnelDomain, tunnelPubkey, tunnelListen,
+	tunnelBinary, tunnelProfile, scanDomain, scanInterval string,
+	scanMinScore, scanTop, scanWorkers int) {
+
+	// If tunnel-profile is a file path, read the URI from it
+	if tunnelProfile != "" && !strings.HasPrefix(tunnelProfile, "slipnet://") {
+		data, err := os.ReadFile(tunnelProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading profile file %q: %v\n", tunnelProfile, err)
+			os.Exit(1)
+		}
+		// Find the slipnet:// URI in the file (first line that starts with it)
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "slipnet://") {
+				tunnelProfile = line
+				break
+			}
+		}
+		if !strings.HasPrefix(tunnelProfile, "slipnet://") {
+			fmt.Fprintf(os.Stderr, "Error: file %q does not contain a slipnet:// URI\n", tunnelProfile)
+			os.Exit(1)
+		}
+	}
+
+	// Parse slipnet:// profile if provided — extract domain, pubkey, type
+	if tunnelProfile != "" {
+		profile, err := ParseSlipNetURI(tunnelProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing slipnet:// profile: %v\n", err)
+			os.Exit(1)
+		}
+		// Fill in from profile unless explicitly overridden by flags
+		if tunnelDomain == "" {
+			tunnelDomain = profile.Domain
+		}
+		if tunnelPubkey == "" {
+			tunnelPubkey = profile.PublicKey
+		}
+		if tunnelType == "dnstt" { // default value — use profile's type
+			tunnelType = profile.DisplayTunnelType()
+		}
+		slog.Info("Parsed slipnet:// profile",
+			"name", profile.Name,
+			"type", profile.TunnelType,
+			"domain", profile.Domain,
+			"transport", profile.DNSTransport,
+			"ssh", profile.IsSSH(),
+		)
+	}
+
+	// Validate required fields
+	if tunnelDomain == "" {
+		fmt.Fprintln(os.Stderr, "Error: --tunnel requires --tunnel-domain or --tunnel-profile with a domain")
+		os.Exit(1)
+	}
+	if tunnelPubkey == "" {
+		fmt.Fprintln(os.Stderr, "Error: --tunnel requires --tunnel-pubkey or --tunnel-profile with a public key")
+		os.Exit(1)
+	}
+
+	// Default scan domain to tunnel domain
+	if scanDomain == "" {
+		scanDomain = tunnelDomain
+	}
+
+	if len(parsed) == 0 {
+		if doh {
+			for _, u := range defaultDoHResolvers {
+				parsed = append(parsed, Resolver{URL: u})
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, "Error: no resolvers specified. Use -r or -f.")
+			os.Exit(1)
+		}
+	}
+
+	interval, err := time.ParseDuration(scanInterval)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid --scan-interval %q: %v\n", scanInterval, err)
+		os.Exit(1)
+	}
+
+	modeStr := "UDP"
+	if doh {
+		modeStr = "DoH (HTTPS)"
+	}
+
+	fmt.Println()
+	fmt.Println("╔══════════════════════════════════════════════════════╗")
+	fmt.Println("║          DNS Multiplexer — Tunnel Mode              ║")
+	fmt.Println("╚══════════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Printf("  Tunnel type:   %s\n", tunnelType)
+	fmt.Printf("  Domain:        %s\n", scanDomain)
+	fmt.Printf("  SOCKS5 proxy:  %s\n", tunnelListen)
+	fmt.Printf("  DNS proxy:     %s\n", listen)
+	fmt.Printf("  Upstream:      %s (%d resolvers)\n", modeStr, len(parsed))
+	fmt.Printf("  Scan interval: %s\n", interval)
+	fmt.Printf("  Min score:     %d/6\n", scanMinScore)
+	fmt.Printf("  Top N:         %d\n", scanTop)
+	fmt.Printf("  Scan workers:  %d\n", scanWorkers)
+	fmt.Println()
+
+	// Create pool with all resolvers
+	pool := NewResolverPool(parsed, mode, doh)
+
+	// Cache
+	var cache *DNSCache
+	if cacheEnabled {
+		cache = NewDNSCache(cacheSize)
+		slog.Info("DNS cache enabled", "max_entries", cacheSize)
+	}
+
+	// Start DNS proxy (the tunnel client will use this)
+	udp := NewUDPProxy(listen, pool, cache)
+	go func() {
+		if err := udp.Start(); err != nil {
+			slog.Error("UDP proxy failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	var tcpProxy *TCPProxy
+	if tcp {
+		tcpProxy = NewTCPProxy(listen, pool, cache)
+		go func() {
+			if err := tcpProxy.Start(); err != nil {
+				slog.Error("TCP proxy failed", "err", err)
+			}
+		}()
+	}
+
+	// Cover traffic
+	var coverTraffic *CoverTraffic
+	if cover {
+		coverTraffic = NewCoverTraffic(pool, coverMin, coverMax)
+		coverTraffic.Start()
+	}
+
+	// Health check
+	if healthCheck {
+		go func() {
+			for {
+				time.Sleep(HealthCheckInterval)
+				pool.HealthCheck()
+				slog.Info("Health check", "healthy", pool.HealthyCount(), "total", len(pool.resolvers))
+			}
+		}()
+	}
+
+	// Stats
+	if stats {
+		go func() {
+			for {
+				time.Sleep(StatsInterval)
+				slog.Info("Stats", "queries", udp.QueryCount())
+				fmt.Fprint(os.Stderr, pool.StatsString())
+			}
+		}()
+	}
+
+	// Start auto-scanner (initial scan is synchronous — blocks until done)
+	autoScanner := NewAutoScanner(pool, parsed, scanDomain, doh, interval, scanMinScore, scanTop, scanWorkers)
+	autoScanner.Start()
+
+	// Start tunnel client (pointed at the multiplexer's DNS proxy)
+	tunnelMgr := NewTunnelManager(TunnelConfig{
+		Binary:     tunnelBinary,
+		Profile:    tunnelProfile,
+		Domain:     tunnelDomain,
+		PublicKey:  tunnelPubkey,
+		TunnelType: tunnelType,
+		ListenAddr: tunnelListen,
+		DNSAddr:    listen,
+	})
+	if err := tunnelMgr.Start(); err != nil {
+		slog.Error("Failed to start tunnel", "err", err)
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	fmt.Printf("  Tunnel running. Users connect to SOCKS5 at %s\n", tunnelListen)
+	fmt.Printf("  For SSH access: ssh -o ProxyCommand=\"nc -x %s %%h %%p\" user@remote\n", tunnelListen)
+	fmt.Println()
+
+	// Wait for signal
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	slog.Info("Shutting down...")
+	tunnelMgr.Stop()
+	autoScanner.Stop()
 	udp.Stop()
 	if tcpProxy != nil {
 		tcpProxy.Stop()

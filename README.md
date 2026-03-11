@@ -177,30 +177,143 @@ Each resolver gets a score out of 6:
 | EDNS | EDNS0 payload size (512/900/1232) |
 | NXD | NXDOMAIN correctness (DNS hijacking detection) |
 
+## Tunnel Mode (Integrated dnstt/noizdns Client)
+
+Tunnel mode manages the complete stack: DNS proxy + periodic resolver scanning + slipnet tunnel client. Users connect via SOCKS5 or SSH.
+
+```
+[Users] --> SOCKS5 :1080 --> [slipnet client] --> DNS --> [multiplexer :53] --> [best resolver] --> [dnstt-server]
+```
+
+The tunnel client uses the multiplexer as its DNS resolver. When the auto-scanner finds better resolvers, the pool is updated seamlessly -- no tunnel restart needed.
+
+### With a slipnet:// config
+
+```bash
+dns-multiplexer -tunnel \
+  -tunnel-profile "slipnet://BASE64..." \
+  -f resolvers-30k.txt
+```
+
+The profile is parsed automatically to extract domain, public key, and tunnel type.
+
+### With a config file
+
+```bash
+dns-multiplexer -tunnel \
+  -tunnel-profile ./my-server.conf \
+  -f resolvers-30k.txt
+```
+
+### With individual flags
+
+```bash
+dns-multiplexer -tunnel \
+  -tunnel-type noizdns \
+  -tunnel-domain t.example.com \
+  -tunnel-pubkey 0123456789abcdef... \
+  -f resolvers.txt
+```
+
+### Large resolver lists (30K+)
+
+```bash
+dns-multiplexer -tunnel \
+  -tunnel-profile "slipnet://..." \
+  -f resolvers-30k.txt \
+  -scan-workers 200 \
+  -scan-top 20 \
+  -scan-min-score 4 \
+  -scan-interval 10m \
+  -health-check -stats -cache
+```
+
+- 200 concurrent workers scan all 30K resolvers in ~5-8 minutes
+- Only the top 20 (by score + latency) go into the active pool
+- Re-scans every 10 minutes to adapt to resolver changes
+- Resolvers scoring below 4/6 are excluded
+
+### User access
+
+SOCKS5 proxy:
+
+```bash
+curl --socks5-hostname SERVER:1080 https://ifconfig.me
+```
+
+SSH through the tunnel:
+
+```bash
+ssh -o ProxyCommand="nc -x SERVER:1080 %h %p" user@remote
+```
+
 ## Files
 
 | File | Description |
 |------|-------------|
-| `dns-mux.py` | DNS multiplexer proxy (Python 3, no dependencies) |
+| `main.go` | CLI entry point, flag parsing, mode routing |
+| `proxy.go` | UDP and TCP DNS proxy implementations |
+| `pool.go` | Resolver pool with health tracking and round-robin/random selection |
+| `transport.go` | UDP and DoH DNS transport |
+| `scanner.go` | 6-point tunnel compatibility scanner |
+| `cache.go` | LRU DNS response cache with TTL expiry |
+| `cover.go` | Cover traffic generator |
+| `config.go` | slipnet:// profile URI parser |
+| `autoscan.go` | Periodic scanning and top-N resolver selection |
+| `tunnel.go` | slipnet subprocess management with auto-restart |
 | `deploy.sh` | Deployment script + `dns-mux` management command |
-| `resolvers.txt` | 96 DNS resolvers (public + Iranian) |
-| `bin/` | Pre-built dnstt-server binaries (optional `--with-dnstt`) |
+| `resolvers.txt` | DNS resolvers (public + Iranian) |
 
-## dns-mux.py Options
+## All Flags
 
-```
---listen, -l ADDR:PORT   Listen address (default: 0.0.0.0:53)
---resolver, -r IP        Upstream resolver (repeatable)
---resolvers-file, -f     File with resolver list
---doh                    Use DoH (HTTPS) upstream instead of UDP
---no-auto-select         Skip startup probe, use all resolvers without testing
---mode, -m               round-robin or random (default: round-robin)
---tcp                    Also handle TCP DNS queries
---cover                  Generate cover traffic (legit DNS queries)
---health-check           Periodic resolver health probes
---stats                  Log query statistics
---scan                   Scan resolvers for tunnel compatibility
---scan-domain DOMAIN     Tunnel domain to test (required for --scan)
+### General
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-listen`, `-l` | `0.0.0.0:53` | DNS proxy listen address |
+| `-resolver`, `-r` | | Upstream resolver (repeatable) |
+| `-resolvers-file`, `-f` | | File with resolver list (one per line, `#` comments) |
+| `-doh` | `false` | Use DoH for upstream resolvers |
+| `-mode`, `-m` | `round-robin` | Distribution: `round-robin` or `random` |
+| `-no-auto-select` | `false` | Skip startup probe |
+| `-tcp` | `false` | Also listen for TCP DNS queries |
+| `-cache` | `false` | Enable DNS response cache |
+| `-cache-size` | `10000` | Max cache entries |
+| `-health-check` | `false` | Periodic health checks (every 30s) |
+| `-stats` | `false` | Log query statistics (every 60s) |
+| `-cover` | `false` | Generate cover traffic |
+| `-cover-min` | `5.0` | Min cover traffic interval (seconds) |
+| `-cover-max` | `15.0` | Max cover traffic interval (seconds) |
+| `-log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+### Scan Mode
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-scan` | `false` | Run one-shot tunnel compatibility scan |
+| `-scan-domain` | | Tunnel domain for testing |
+
+### Tunnel Mode
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-tunnel` | `false` | Enable tunnel mode |
+| `-tunnel-profile` | | `slipnet://` URI or path to file containing one |
+| `-tunnel-type` | `dnstt` | Tunnel type: `dnstt` or `noizdns` |
+| `-tunnel-domain` | | Tunnel domain (auto-filled from profile) |
+| `-tunnel-pubkey` | | Server public key hex (auto-filled from profile) |
+| `-tunnel-listen` | `0.0.0.0:1080` | SOCKS5 listen address for users |
+| `-tunnel-binary` | `slipnet` | Path to slipnet CLI binary |
+| `-scan-interval` | `5m` | Auto-scan interval (e.g. `5m`, `10m`, `1h`) |
+| `-scan-min-score` | `3` | Minimum score (0-6) for a resolver to be used |
+| `-scan-top` | `20` | Keep only top N resolvers in active pool |
+| `-scan-workers` | `200` | Concurrent workers for scanning |
+
+## Build
+
+```bash
+cd dns-multiplexer
+go build -o bin/dns-multiplexer .
 ```
 
 ## deploy.sh Options
