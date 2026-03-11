@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -159,8 +160,11 @@ func main() {
 				parsed = append(parsed, Resolver{URL: u})
 			}
 		} else {
-			fmt.Fprintln(os.Stderr, "Error: no resolvers configured. Use -r or -f to specify resolvers.")
-			os.Exit(1)
+			parsed = tryLoadDefaultResolvers(doh)
+			if len(parsed) == 0 {
+				fmt.Fprintln(os.Stderr, "Error: no resolvers configured. Use -r, -f, or place resolvers.txt next to the binary.")
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -329,8 +333,12 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 				parsed = append(parsed, Resolver{URL: u})
 			}
 		} else {
-			fmt.Fprintln(os.Stderr, "Error: no resolvers specified. Use -r or -f.")
-			os.Exit(1)
+			// Try loading resolvers.txt from next to the binary
+			parsed = tryLoadDefaultResolvers(doh)
+			if len(parsed) == 0 {
+				fmt.Fprintln(os.Stderr, "Error: no resolvers specified. Use -r, -f, or place resolvers.txt next to the binary.")
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -489,6 +497,35 @@ func parseResolvers(file string, rawResolvers []string, doh bool) []Resolver {
 	}
 
 	return resolvers
+}
+
+// tryLoadDefaultResolvers looks for resolvers.txt next to the binary, then in
+// the current working directory. Returns nil if not found.
+func tryLoadDefaultResolvers(doh bool) []Resolver {
+	candidates := []string{}
+
+	// Next to the binary
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(dir, "resolvers.txt"))
+		// If binary is in bin/, also check parent dir
+		candidates = append(candidates, filepath.Join(dir, "..", "resolvers.txt"))
+	}
+
+	// Current working directory
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, "resolvers.txt"))
+	}
+
+	for _, path := range candidates {
+		resolved := parseResolvers(path, nil, doh)
+		if len(resolved) > 0 {
+			slog.Info("Auto-loaded default resolvers", "file", path, "count", len(resolved))
+			return resolved
+		}
+	}
+
+	return nil
 }
 
 func parseOneResolver(value string, doh bool) (Resolver, bool) {
