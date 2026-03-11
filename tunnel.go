@@ -129,12 +129,54 @@ func (tm *TunnelManager) buildArgs() []string {
 	}
 
 	if tm.config.Profile != "" {
-		args = append(args, tm.config.Profile)
+		args = append(args, tm.patchProfileHost(tm.config.Profile))
 	} else {
 		args = append(args, tm.generateProfileURI())
 	}
 
 	return args
+}
+
+// patchProfileHost rewrites the host field (index 9) in a slipnet:// profile
+// to match the configured ListenAddr. The slipnet CLI reads the host from the
+// profile and has no --host flag, so we must patch it here.
+func (tm *TunnelManager) patchProfileHost(uri string) string {
+	if tm.config.ListenAddr == "" {
+		return uri
+	}
+	host, _, err := net.SplitHostPort(tm.config.ListenAddr)
+	if err != nil || host == "" {
+		return uri
+	}
+
+	const scheme = "slipnet://"
+	if !strings.HasPrefix(uri, scheme) {
+		return uri
+	}
+
+	encoded := strings.TrimPrefix(uri, scheme)
+	encoded = strings.Join(strings.Fields(encoded), "")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		// Try with padding
+		padded := encoded
+		for len(padded)%4 != 0 {
+			padded += "="
+		}
+		decoded, err = base64.StdEncoding.DecodeString(padded)
+		if err != nil {
+			return uri
+		}
+	}
+
+	fields := strings.Split(string(decoded), "|")
+	if len(fields) < 10 {
+		return uri
+	}
+
+	fields[9] = host // host field
+	patched := strings.Join(fields, "|")
+	return scheme + base64.StdEncoding.EncodeToString([]byte(patched))
 }
 
 func (tm *TunnelManager) generateProfileURI() string {
