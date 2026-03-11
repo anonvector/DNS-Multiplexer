@@ -29,13 +29,55 @@ A middle proxy that distributes DNS tunnel queries across multiple upstream reso
 - **Health monitoring** automatically routes around failed resolvers
 - **96 built-in resolvers** including Iranian DNS servers (Shecan, Electro, Begzar, etc.)
 
-## One-Line Install
+## Quick Start: Tunnel Mode (Instant)
+
+Install and run a dnstt/noizdns tunnel with auto-scanning resolver selection in one command:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/anonvector/DNS-Multiplexer/main/deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/anonvector/DNS-Multiplexer/main/deploy.sh) \
+  --auto --tunnel --profile "slipnet://YOUR_BASE64_PROFILE"
 ```
 
-Or non-interactive with defaults:
+This will:
+1. Download `dns-multiplexer` + `slipnet` binaries for your architecture
+2. Install the bundled resolver list (80+ public and Iranian resolvers)
+3. Scan all resolvers, pick the top 20 by tunnel compatibility score
+4. Start the tunnel as a systemd service (auto-restarts on crash/reboot)
+5. Expose a SOCKS5 proxy on `0.0.0.0:1080`
+6. Re-scan resolvers every 5 minutes and swap in better ones seamlessly
+
+Users connect via SOCKS5:
+
+```bash
+curl --socks5-hostname SERVER_IP:1080 https://ifconfig.me
+```
+
+Or SSH through the tunnel:
+
+```bash
+ssh -o ProxyCommand="nc -x SERVER_IP:1080 %h %p" user@remote
+```
+
+### Run without installing
+
+If you already have the binary and `resolvers.txt` in the same directory:
+
+```bash
+./dns-multiplexer -tunnel -tunnel-profile "slipnet://..."
+```
+
+### Manual deploy (SCP when GitHub is blocked)
+
+```bash
+scp -r dns-multiplexer/ root@SERVER:/opt/dns-multiplexer/
+ssh root@SERVER
+cd /opt/dns-multiplexer
+bash deploy.sh --auto --tunnel --profile "slipnet://..."
+```
+
+## One-Line Install (Proxy Only)
+
+Standard DNS proxy mode without the tunnel client:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/anonvector/DNS-Multiplexer/main/deploy.sh) --auto
