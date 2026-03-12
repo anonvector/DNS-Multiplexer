@@ -142,7 +142,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Tunnel mode
+	// Tunnel mode — default DNS listen to localhost (only slipnet client needs it)
+	if tunnel && listen == "0.0.0.0:53" {
+		listen = "127.0.0.1:53"
+	}
+
 	if tunnel {
 		runTunnelMode(parsed, doh, mode, listen, tcp, cacheEnabled, cacheSize,
 			cover, coverMin, coverMax, healthCheck, stats,

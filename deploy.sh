@@ -403,7 +403,12 @@ create_service() {
 
     # Build command line arguments
     EXEC_ARGS="$INSTALL_DIR/dns-multiplexer"
-    EXEC_ARGS+=" --listen $LISTEN_ADDR:$LISTEN_PORT"
+    # In tunnel mode, DNS proxy only needs localhost (slipnet client is local)
+    if [[ "$ENABLE_TUNNEL" == "true" ]]; then
+        EXEC_ARGS+=" --listen 127.0.0.1:$LISTEN_PORT"
+    else
+        EXEC_ARGS+=" --listen $LISTEN_ADDR:$LISTEN_PORT"
+    fi
     EXEC_ARGS+=" --mode $MODE"
 
     if [[ "$ENABLE_DOH" == "true" ]]; then

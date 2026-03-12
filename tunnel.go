@@ -201,7 +201,14 @@ func (tm *TunnelManager) generateProfileURI() string {
 	fields[6] = "5000"               // keepAlive
 	fields[7] = "bbr"               // cc
 	fields[8] = "1080"               // port (overridden by --port)
-	fields[9] = "0.0.0.0"           // host
+	// Extract host from ListenAddr for SOCKS5 binding
+	listenHost := "0.0.0.0"
+	if tm.config.ListenAddr != "" {
+		if h, _, err := net.SplitHostPort(tm.config.ListenAddr); err == nil && h != "" {
+			listenHost = h
+		}
+	}
+	fields[9] = listenHost           // host
 	fields[10] = "0"                 // gso
 	fields[11] = tm.config.PublicKey // publicKey
 	fields[22] = "udp"              // dnsTransport
