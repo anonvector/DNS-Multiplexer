@@ -23,6 +23,13 @@ type SlipNetProfile struct {
 	PublicKey    string
 	DNSTransport string // udp, tcp, tls, https
 	DoHURL       string
+
+	// SSH fields (for _ssh tunnel types)
+	SSHUsername string
+	SSHPassword string
+	SSHPort     int
+	SSHHost     string
+	SSHAuthType string // "password" or "key"
 }
 
 // DisplayTunnelType returns a human-friendly tunnel type name.
@@ -54,7 +61,6 @@ func ParseSlipNetURI(uri string) (*SlipNetProfile, error) {
 
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		// Try with padding
 		for len(encoded)%4 != 0 {
 			encoded += "="
 		}
@@ -77,6 +83,8 @@ func ParseSlipNetURI(uri string) (*SlipNetProfile, error) {
 		Resolvers:  fields[4],
 		Host:       "127.0.0.1",
 		Port:       1080,
+		SSHPort:    22,
+		SSHHost:    "127.0.0.1",
 	}
 
 	if fields[5] == "1" {
@@ -97,11 +105,29 @@ func ParseSlipNetURI(uri string) (*SlipNetProfile, error) {
 	}
 	p.PublicKey = fields[11]
 
+	// SSH fields
+	if len(fields) > 15 && fields[15] != "" {
+		p.SSHUsername = fields[15]
+	}
+	if len(fields) > 16 && fields[16] != "" {
+		p.SSHPassword = fields[16]
+	}
+	if len(fields) > 17 && fields[17] != "" {
+		if v, err := strconv.Atoi(fields[17]); err == nil && v > 0 {
+			p.SSHPort = v
+		}
+	}
+	if len(fields) > 19 && fields[19] != "" {
+		p.SSHHost = fields[19]
+	}
 	if len(fields) > 22 && fields[22] != "" {
 		p.DNSTransport = fields[22]
 	}
 	if len(fields) > 21 && fields[21] != "" {
 		p.DoHURL = fields[21]
+	}
+	if len(fields) > 23 && fields[23] != "" {
+		p.SSHAuthType = fields[23]
 	}
 
 	return p, nil

@@ -294,6 +294,21 @@ install_proxy() {
         fi
         chmod +x "$INSTALL_DIR/slipnet"
         print_status "Installed: $INSTALL_DIR/slipnet"
+
+        # Install sshpass for SSH-chained profiles
+        if ! command -v sshpass &>/dev/null; then
+            print_status "Installing sshpass for SSH tunneling..."
+            case "$PKG_MGR" in
+                apt) apt-get install -y -qq sshpass 2>/dev/null ;;
+                dnf) dnf install -y -q sshpass 2>/dev/null ;;
+                yum) yum install -y -q sshpass 2>/dev/null ;;
+            esac
+            if command -v sshpass &>/dev/null; then
+                print_status "sshpass installed"
+            else
+                print_warning "sshpass not available — SSH-chained profiles may not work"
+            fi
+        fi
     fi
 
     # Also install legacy Python proxy if present

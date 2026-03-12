@@ -290,29 +290,30 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 		}
 	}
 
-	// Parse slipnet:// profile if provided — extract domain, pubkey, type
+	// Parse slipnet:// profile if provided — extract domain, pubkey, type, SSH
+	var parsedProfile *SlipNetProfile
 	if tunnelProfile != "" {
-		profile, err := ParseSlipNetURI(tunnelProfile)
+		var err error
+		parsedProfile, err = ParseSlipNetURI(tunnelProfile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing slipnet:// profile: %v\n", err)
 			os.Exit(1)
 		}
-		// Fill in from profile unless explicitly overridden by flags
 		if tunnelDomain == "" {
-			tunnelDomain = profile.Domain
+			tunnelDomain = parsedProfile.Domain
 		}
 		if tunnelPubkey == "" {
-			tunnelPubkey = profile.PublicKey
+			tunnelPubkey = parsedProfile.PublicKey
 		}
-		if tunnelType == "dnstt" { // default value — use profile's type
-			tunnelType = profile.DisplayTunnelType()
+		if tunnelType == "dnstt" {
+			tunnelType = parsedProfile.DisplayTunnelType()
 		}
 		slog.Info("Parsed slipnet:// profile",
-			"name", profile.Name,
-			"type", profile.TunnelType,
-			"domain", profile.Domain,
-			"transport", profile.DNSTransport,
-			"ssh", profile.IsSSH(),
+			"name", parsedProfile.Name,
+			"type", parsedProfile.TunnelType,
+			"domain", parsedProfile.Domain,
+			"transport", parsedProfile.DNSTransport,
+			"ssh", parsedProfile.IsSSH(),
 		)
 	}
 
@@ -436,7 +437,7 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 	autoScanner.Start()
 
 	// Start tunnel client (pointed at the multiplexer's DNS proxy)
-	tunnelMgr := NewTunnelManager(TunnelConfig{
+	tunnelCfg := TunnelConfig{
 		Binary:     tunnelBinary,
 		Profile:    tunnelProfile,
 		Domain:     tunnelDomain,
@@ -444,7 +445,16 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 		TunnelType: tunnelType,
 		ListenAddr: tunnelListen,
 		DNSAddr:    listen,
-	})
+	}
+	// SSH chaining for _ssh profiles
+	if parsedProfile != nil && parsedProfile.IsSSH() {
+		tunnelCfg.SSHEnabled = true
+		tunnelCfg.SSHUsername = parsedProfile.SSHUsername
+		tunnelCfg.SSHPassword = parsedProfile.SSHPassword
+		tunnelCfg.SSHPort = parsedProfile.SSHPort
+		slog.Info("SSH chaining enabled", "user", parsedProfile.SSHUsername, "ssh_port", parsedProfile.SSHPort)
+	}
+	tunnelMgr := NewTunnelManager(tunnelCfg)
 	if err := tunnelMgr.Start(); err != nil {
 		slog.Error("Failed to start tunnel", "err", err)
 		os.Exit(1)
