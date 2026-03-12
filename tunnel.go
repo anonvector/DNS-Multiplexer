@@ -129,7 +129,7 @@ func (tm *TunnelManager) buildArgs() []string {
 	}
 
 	if tm.config.Profile != "" {
-		args = append(args, tm.patchProfileHost(tm.config.Profile))
+		args = append(args, tm.patchProfile(tm.config.Profile))
 	} else {
 		args = append(args, tm.generateProfileURI())
 	}
@@ -137,18 +137,11 @@ func (tm *TunnelManager) buildArgs() []string {
 	return args
 }
 
-// patchProfileHost rewrites the host field (index 9) in a slipnet:// profile
-// to match the configured ListenAddr. The slipnet CLI reads the host from the
-// profile and has no --host flag, so we must patch it here.
-func (tm *TunnelManager) patchProfileHost(uri string) string {
-	if tm.config.ListenAddr == "" {
-		return uri
-	}
-	host, _, err := net.SplitHostPort(tm.config.ListenAddr)
-	if err != nil || host == "" {
-		return uri
-	}
-
+// patchProfile rewrites the slipnet:// profile to:
+// - Set host (field 9) to match ListenAddr so SOCKS5 binds on all interfaces
+// - Strip _ssh suffix from tunnel type (field 1) — the multiplexer handles
+//   SOCKS5 only, SSH chaining is not needed in server/tunnel mode
+func (tm *TunnelManager) patchProfile(uri string) string {
 	const scheme = "slipnet://"
 	if !strings.HasPrefix(uri, scheme) {
 		return uri
@@ -158,7 +151,6 @@ func (tm *TunnelManager) patchProfileHost(uri string) string {
 	encoded = strings.Join(strings.Fields(encoded), "")
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		// Try with padding
 		padded := encoded
 		for len(padded)%4 != 0 {
 			padded += "="
@@ -174,7 +166,16 @@ func (tm *TunnelManager) patchProfileHost(uri string) string {
 		return uri
 	}
 
-	fields[9] = host // host field
+	// Strip _ssh suffix — tunnel mode is SOCKS5 only
+	fields[1] = strings.TrimSuffix(fields[1], "_ssh")
+
+	// Set host to match tunnel-listen so SOCKS5 binds on all interfaces
+	if tm.config.ListenAddr != "" {
+		if host, _, err := net.SplitHostPort(tm.config.ListenAddr); err == nil && host != "" {
+			fields[9] = host
+		}
+	}
+
 	patched := strings.Join(fields, "|")
 	return scheme + base64.StdEncoding.EncodeToString([]byte(patched))
 }
