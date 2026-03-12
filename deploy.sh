@@ -520,71 +520,66 @@ DNSTTEOF
 # ─── Interactive Configuration ───────────────────────────────────────────────
 
 interactive_config() {
-    print_header "DNS Multiplexer Configuration"
+    print_header "Setup"
 
-    # Listen port
-    print_question "Listen port [53]: "
+    echo -e "  ${BOLD}1)${NC} Proxy only    — DNS proxy for your own dnstt/slipnet client"
+    echo -e "  ${BOLD}2)${NC} Tunnel mode   — Full tunnel: users connect via SOCKS5 proxy"
+    echo ""
+    print_question "Choose mode [1]: "
     read -r input
-    LISTEN_PORT="${input:-53}"
 
-    # Distribution mode
-    print_question "Distribution mode (round-robin/random) [round-robin]: "
-    read -r input
-    MODE="${input:-round-robin}"
+    if [[ "${input:-1}" == "2" ]]; then
+        ENABLE_TUNNEL=true
 
-    # TCP support
-    print_question "Enable TCP DNS proxy? (y/n) [y]: "
-    read -r input
-    [[ "${input:-y}" == "n" ]] && ENABLE_TCP=false
-
-    # Cover traffic
-    print_question "Enable cover traffic? (y/n) [y]: "
-    read -r input
-    [[ "${input:-y}" == "n" ]] && ENABLE_COVER=false
-
-    # Health checks
-    print_question "Enable resolver health checks? (y/n) [y]: "
-    read -r input
-    [[ "${input:-y}" == "n" ]] && ENABLE_HEALTH=false
-
-    # Stats
-    print_question "Enable statistics logging? (y/n) [y]: "
-    read -r input
-    [[ "${input:-y}" == "n" ]] && ENABLE_STATS=false
-
-    # Custom resolvers
-    print_question "Use default resolvers list? (y/n) [y]: "
-    read -r input
-    if [[ "${input:-y}" == "n" ]]; then
-        echo "Enter resolvers (one per line, empty line to finish):"
-        CUSTOM_RESOLVERS=""
-        while true; do
-            read -r resolver
-            [[ -z "$resolver" ]] && break
-            CUSTOM_RESOLVERS+="$resolver"$'\n'
-        done
-        if [[ -n "$CUSTOM_RESOLVERS" ]]; then
-            echo "$CUSTOM_RESOLVERS" > "$SCRIPT_DIR/custom_resolvers.txt"
-            RESOLVERS_FILE="custom_resolvers.txt"
+        echo ""
+        print_question "Paste your slipnet:// config: "
+        read -r input
+        if [[ -z "$input" ]]; then
+            print_error "slipnet:// config is required for tunnel mode"
+            exit 1
         fi
+        TUNNEL_PROFILE="$input"
+
+        print_question "SOCKS5 port for users [1080]: "
+        read -r input
+        if [[ -n "$input" ]]; then
+            TUNNEL_LISTEN="0.0.0.0:$input"
+        fi
+
+        print_question "DNS proxy port [53]: "
+        read -r input
+        LISTEN_PORT="${input:-53}"
+
+        print_question "Re-scan interval [5m]: "
+        read -r input
+        SCAN_INTERVAL="${input:-5m}"
+
+        echo ""
+        print_status "Configuration:"
+        echo "  Mode:         Tunnel (SOCKS5 proxy for users)"
+        echo "  SOCKS5:       $TUNNEL_LISTEN"
+        echo "  DNS proxy:    127.0.0.1:$LISTEN_PORT"
+        echo "  Scan interval: $SCAN_INTERVAL"
+        echo "  Top resolvers: $SCAN_TOP"
+    else
+        # Proxy-only mode
+        print_question "Listen port [53]: "
+        read -r input
+        LISTEN_PORT="${input:-53}"
+
+        print_question "Use DoH upstream? (y/n) [n]: "
+        read -r input
+        [[ "${input:-n}" == "y" ]] && ENABLE_DOH=true
+
+        echo ""
+        print_status "Configuration:"
+        echo "  Mode:         DNS proxy"
+        echo "  Listen:       $LISTEN_ADDR:$LISTEN_PORT"
+        echo "  DoH:          $ENABLE_DOH"
     fi
 
-    # Deploy dnstt-server alongside
-    print_question "Also deploy dnstt-server on this machine? (y/n) [n]: "
-    read -r input
-    [[ "${input:-n}" == "y" ]] && ALSO_DEPLOY_DNSTT=true
-
     echo ""
-    print_status "Configuration:"
-    echo "  Port:         $LISTEN_PORT"
-    echo "  Mode:         $MODE"
-    echo "  TCP:          $ENABLE_TCP"
-    echo "  Cover:        $ENABLE_COVER"
-    echo "  Health:       $ENABLE_HEALTH"
-    echo "  Stats:        $ENABLE_STATS"
-    echo "  dnstt-server: $ALSO_DEPLOY_DNSTT"
-    echo ""
-    print_question "Proceed with installation? (y/n) [y]: "
+    print_question "Proceed? (y/n) [y]: "
     read -r input
     if [[ "${input:-y}" == "n" ]]; then
         echo "Aborted."
