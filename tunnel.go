@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,12 +33,13 @@ type TunnelConfig struct {
 
 // TunnelManager manages slipnet + optional SSH subprocess.
 type TunnelManager struct {
-	config     TunnelConfig
-	mu         sync.Mutex
-	tunnelCmd  *exec.Cmd // slipnet process
-	sshCmd     *exec.Cmd // ssh -D process (only for _ssh profiles)
-	stopped    bool
-	tunnelPort string // internal port slipnet listens on (SSH mode only)
+	config      TunnelConfig
+	mu          sync.Mutex
+	tunnelCmd   *exec.Cmd // slipnet process
+	sshCmd      *exec.Cmd // ssh -D process (only for _ssh profiles)
+	stopped     bool
+	tunnelPort  string // internal port slipnet listens on (SSH mode only)
+	askpassPath string // temp SSH_ASKPASS script (cleaned up on Stop)
 }
 
 func NewTunnelManager(config TunnelConfig) *TunnelManager {
@@ -152,19 +154,29 @@ func (tm *TunnelManager) startSSH(tunnelAddr string) error {
 		fmt.Sprintf("%s@127.0.0.1", tm.config.SSHUsername),
 	}
 
-	sshCmd := exec.Command("sshpass", append([]string{"-p", tm.config.SSHPassword}, append([]string{"ssh"}, sshArgs...)...)...)
-	sshCmd.Stdout = os.Stdout
-	sshCmd.Stderr = os.Stderr
+	var sshCmd *exec.Cmd
+	if _, err := exec.LookPath("sshpass"); err == nil {
+		sshCmd = exec.Command("sshpass", append([]string{"-p", tm.config.SSHPassword}, append([]string{"ssh"}, sshArgs...)...)...)
+		sshCmd.Stdout = os.Stdout
+		sshCmd.Stderr = os.Stderr
+	} else {
+		slog.Warn("sshpass not found, using SSH_ASKPASS fallback")
+		// Create a helper script that outputs the password for SSH_ASKPASS
+		askpass := filepath.Join(os.TempDir(), fmt.Sprintf("dns-mux-askpass-%d", os.Getpid()))
+		escapedPass := strings.ReplaceAll(tm.config.SSHPassword, "'", "'\\''")
+		script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '%s'\n", escapedPass)
+		if err := os.WriteFile(askpass, []byte(script), 0700); err != nil {
+			return fmt.Errorf("creating askpass helper: %w", err)
+		}
+		tm.askpassPath = askpass
 
-	// Fall back to ssh with SSH_ASKPASS if sshpass not available
-	if _, err := exec.LookPath("sshpass"); err != nil {
-		slog.Warn("sshpass not found, trying SSH_ASKPASS")
 		sshCmd = exec.Command("ssh", sshArgs...)
 		sshCmd.Stdout = os.Stdout
 		sshCmd.Stderr = os.Stderr
 		sshCmd.Env = append(os.Environ(),
-			fmt.Sprintf("SSH_ASKPASS_REQUIRE=force"),
-			fmt.Sprintf("DISPLAY=:0"),
+			"SSH_ASKPASS="+askpass,
+			"SSH_ASKPASS_REQUIRE=force",
+			"DISPLAY=:0",
 		)
 	}
 
@@ -222,7 +234,6 @@ func (tm *TunnelManager) monitorSSH(cmd *exec.Cmd) {
 		tm.sshCmd = nil
 	}
 	stopped := tm.stopped
-	tunnelRunning := tm.tunnelCmd != nil
 	tm.mu.Unlock()
 
 	if stopped {
@@ -234,7 +245,8 @@ func (tm *TunnelManager) monitorSSH(cmd *exec.Cmd) {
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.stopped || tm.sshCmd != nil || !tunnelRunning {
+	// Re-check tunnel state after sleep — it may have restarted or stopped
+	if tm.stopped || tm.sshCmd != nil || tm.tunnelCmd == nil {
 		return
 	}
 
@@ -298,10 +310,15 @@ func (tm *TunnelManager) patchProfile(uri string, listenAddr string) string {
 	// Strip _ssh — we handle SSH chaining separately
 	fields[1] = strings.TrimSuffix(fields[1], "_ssh")
 
-	// Set host for SOCKS5 binding
+	// Set host and port for SOCKS5 binding
 	if listenAddr != "" {
-		if host, _, err := net.SplitHostPort(listenAddr); err == nil && host != "" {
-			fields[9] = host
+		if host, port, err := net.SplitHostPort(listenAddr); err == nil {
+			if host != "" {
+				fields[9] = host
+			}
+			if port != "" {
+				fields[8] = port
+			}
 		}
 	}
 
@@ -392,6 +409,11 @@ func (tm *TunnelManager) Stop() {
 		case <-time.After(5 * time.Second):
 			_ = tunnelCmd.Process.Kill()
 		}
+	}
+
+	// Clean up askpass helper
+	if tm.askpassPath != "" {
+		os.Remove(tm.askpassPath)
 	}
 
 	slog.Info("Tunnel stopped")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -42,18 +43,17 @@ func sendQueryUDP(data []byte, addr string, timeout time.Duration) ([]byte, erro
 }
 
 func sendQueryDoH(data []byte, url string, timeout time.Duration) ([]byte, error) {
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", dohContentType)
 	req.Header.Set("Accept", dohContentType)
 
-	client := &http.Client{
-		Timeout:   timeout,
-		Transport: dohClient.Transport,
-	}
-	resp, err := client.Do(req)
+	resp, err := dohClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

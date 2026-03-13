@@ -75,19 +75,20 @@ func (u *UDPProxy) Start() error {
 		copy(data, buf[:n])
 		atomic.AddUint64(&u.queryCount, 1)
 
+		conn := u.conn
 		sem <- struct{}{}
 		go func(data []byte, addr *net.UDPAddr) {
 			defer func() { <-sem }()
-			u.forward(data, addr)
+			u.forward(conn, data, addr)
 		}(data, clientAddr)
 	}
 }
 
-func (u *UDPProxy) forward(data []byte, clientAddr *net.UDPAddr) {
+func (u *UDPProxy) forward(conn *net.UDPConn, data []byte, clientAddr *net.UDPAddr) {
 	// Check cache
 	if u.cache != nil {
 		if resp, ok := u.cache.Get(data); ok {
-			u.conn.WriteToUDP(resp, clientAddr)
+			conn.WriteToUDP(resp, clientAddr)
 			return
 		}
 	}
@@ -120,7 +121,7 @@ func (u *UDPProxy) forward(data []byte, clientAddr *net.UDPAddr) {
 	if u.cache != nil {
 		u.cache.Put(data, resp)
 	}
-	u.conn.WriteToUDP(resp, clientAddr)
+	conn.WriteToUDP(resp, clientAddr)
 }
 
 func (u *UDPProxy) bindWithRetry() (*net.UDPConn, error) {
@@ -249,9 +250,23 @@ func (t *TCPProxy) handle(conn net.Conn) {
 	if err != nil {
 		t.pool.MarkFailure(resolver)
 		slog.Debug("TCP forward failed", "resolver", resolver, "err", err)
-		return
+
+		// Retry with a different resolver
+		retry := t.pool.GetNext()
+		if retry != resolver {
+			t.pool.MarkSent(retry)
+			resp, err = t.pool.SendQuery(data, retry)
+			if err != nil {
+				t.pool.MarkFailure(retry)
+				return
+			}
+			t.pool.MarkSuccess(retry)
+		} else {
+			return
+		}
+	} else {
+		t.pool.MarkSuccess(resolver)
 	}
-	t.pool.MarkSuccess(resolver)
 
 	if t.cache != nil {
 		t.cache.Put(data, resp)
