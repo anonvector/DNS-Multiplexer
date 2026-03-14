@@ -453,6 +453,14 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 		autoScanner.TriggerRescan()
 	})
 
+	// Use embedded slipnet binary if available and no explicit path was given
+	if tunnelBinary == "slipnet" {
+		if embeddedPath, cleanupDir := extractEmbeddedSlipnet(); embeddedPath != "" {
+			tunnelBinary = embeddedPath
+			defer os.RemoveAll(cleanupDir)
+		}
+	}
+
 	// Start tunnel client (pointed at the multiplexer's DNS proxy)
 	tunnelCfg := TunnelConfig{
 		Binary:     tunnelBinary,
