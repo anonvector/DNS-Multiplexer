@@ -1,8 +1,12 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"sync"
@@ -282,6 +286,201 @@ func scanResolversQuiet(resolvers []Resolver, testDomain string, doh bool, worke
 				wg.Done()
 			}()
 			result := scanResolver(r, testDomain, sendFn)
+			mu.Lock()
+			results = append(results, result)
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+
+	return results
+}
+
+// probeTimeout is the max time for the basic connectivity check.
+// If a resolver can't answer a simple A query in 1.5s it's too slow for tunneling.
+const probeTimeout = 1500 * time.Millisecond
+
+// sendResolverQuery sends a DNS query to a resolver with the given timeout,
+// using the appropriate transport (UDP or DoH).
+func sendResolverQuery(data []byte, r Resolver, doh bool, timeout time.Duration) ([]byte, error) {
+	if doh {
+		return sendQueryDoH(data, r.URL, timeout)
+	}
+	return sendQueryUDP(data, r.Addr, timeout)
+}
+
+// VerifyResult holds the result of verify-scanning a single resolver.
+// Uses basic connectivity probe + HMAC-SHA256 challenge-response instead of
+// the 7-test compatibility scan.
+type VerifyResult struct {
+	Resolver  Resolver
+	Status    string // "WORKING", "TIMEOUT", "ERROR"
+	Verified  bool   // HMAC challenge-response passed
+	LatencyMs int
+}
+
+// verifyResolver tests a resolver with a basic connectivity probe followed
+// by an HMAC-SHA256 challenge-response that proves end-to-end tunnel reachability.
+func verifyResolver(r Resolver, testDomain string, pubkey []byte, doh bool) VerifyResult {
+	result := VerifyResult{Resolver: r}
+
+	// Step 1: Basic connectivity probe with short timeout against parent domain.
+	// Uses the parent domain (not tunnel domain) to test general DNS capability
+	// without hitting the tunnel server.
+	parts := strings.SplitN(testDomain, ".", 2)
+	parentDomain := testDomain
+	if len(parts) == 2 {
+		parentDomain = parts[1]
+	}
+	qname := fmt.Sprintf("%s.%s", randLabel(8), parentDomain)
+	query, _ := buildScanQuery(qname, dns.TypeA, 0)
+
+	t0 := time.Now()
+	resp, err := sendResolverQuery(query, r, doh, probeTimeout)
+	result.LatencyMs = int(time.Since(t0).Milliseconds())
+	if err != nil {
+		if isTimeout(err) {
+			result.Status = "TIMEOUT"
+		} else {
+			result.Status = "ERROR"
+		}
+		return result
+	}
+	if len(resp) < 12 {
+		result.Status = "ERROR"
+		return result
+	}
+	result.Status = "WORKING"
+
+	// Step 2: HMAC-SHA256 challenge-response with full timeout (nzv.<nonceHex>.<domain>)
+	nonce := make([]byte, 16)
+	for i := range nonce {
+		nonce[i] = byte(rand.Intn(256))
+	}
+	nonceHex := hex.EncodeToString(nonce)
+	vqname := fmt.Sprintf("nzv.%s.%s", nonceHex, testDomain)
+	vquery, _ := buildScanQuery(vqname, dns.TypeTXT, 0)
+
+	vresp, err := sendResolverQuery(vquery, r, doh, upstreamTimeout)
+	if err != nil || len(vresp) < 12 {
+		return result
+	}
+
+	var msg dns.Msg
+	if err := msg.Unpack(vresp); err != nil {
+		return result
+	}
+	for _, ans := range msg.Answer {
+		if txt, ok := ans.(*dns.TXT); ok {
+			txtData := strings.Join(txt.Txt, "")
+			mac := hmac.New(sha256.New, pubkey)
+			mac.Write(nonce)
+			expected := hex.EncodeToString(mac.Sum(nil))
+			if txtData == expected {
+				result.Verified = true
+			}
+			break
+		}
+	}
+
+	return result
+}
+
+// verifyResolversWithEarlyReady scans resolvers with challenge-response and
+// calls onReady as soon as targetCount verified resolvers are found.
+// Scanning continues after onReady to find more verified resolvers.
+func verifyResolversWithEarlyReady(resolvers []Resolver, testDomain string, doh bool, workers int,
+	targetCount int, pubkey []byte, onReady func([]Resolver)) []VerifyResult {
+
+	if targetCount <= 0 {
+		targetCount = 20
+	}
+
+	var (
+		mu        sync.Mutex
+		results   []VerifyResult
+		verified  []Resolver
+		readySent bool
+		wg        sync.WaitGroup
+	)
+
+	sem := make(chan struct{}, workers)
+	for _, r := range resolvers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r Resolver) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			result := verifyResolver(r, testDomain, pubkey, doh)
+			mu.Lock()
+			results = append(results, result)
+			if result.Verified {
+				verified = append(verified, result.Resolver)
+				count := len(verified)
+				scanned := len(results)
+				if count >= targetCount && !readySent {
+					readySent = true
+					ready := make([]Resolver, len(verified))
+					copy(ready, verified)
+					mu.Unlock()
+					slog.Info("Auto-scan: found enough verified resolvers", "verified", count, "scanned", scanned)
+					onReady(ready)
+					return
+				}
+				if count == 1 || count == 5 || count == 10 || count == 15 || count == targetCount {
+					slog.Info("Auto-scan progress", "verified", count, "target", targetCount, "scanned", scanned)
+				}
+			}
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+
+	// If we never hit targetCount, call onReady with what we have
+	mu.Lock()
+	if !readySent {
+		ready := make([]Resolver, len(verified))
+		copy(ready, verified)
+		if len(ready) == 0 {
+			// Fallback: any working (but unverified) resolvers
+			for _, r := range results {
+				if r.Status == "WORKING" {
+					ready = append(ready, r.Resolver)
+				}
+			}
+		}
+		mu.Unlock()
+		if len(ready) > 0 {
+			slog.Info("Auto-scan: scan complete, using available resolvers", "count", len(ready))
+			onReady(ready)
+		}
+	} else {
+		mu.Unlock()
+	}
+
+	return results
+}
+
+// verifyResolversQuiet runs verify scanning on all resolvers without early-ready.
+func verifyResolversQuiet(resolvers []Resolver, testDomain string, doh bool, workers int, pubkey []byte) []VerifyResult {
+	var (
+		mu      sync.Mutex
+		results []VerifyResult
+		wg      sync.WaitGroup
+	)
+
+	sem := make(chan struct{}, workers)
+	for _, r := range resolvers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r Resolver) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			result := verifyResolver(r, testDomain, pubkey, doh)
 			mu.Lock()
 			results = append(results, result)
 			mu.Unlock()

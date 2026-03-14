@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -152,7 +153,7 @@ func main() {
 			cover, coverMin, coverMax, healthCheck, stats,
 			tunnelType, tunnelDomain, tunnelPubkey, tunnelListen,
 			tunnelBinary, tunnelProfile, scanDomain, scanInterval,
-			scanMinScore, scanTop, scanWorkers)
+			scanTop, scanWorkers)
 		return
 	}
 
@@ -267,7 +268,7 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 	cover bool, coverMin, coverMax float64, healthCheck, stats bool,
 	tunnelType, tunnelDomain, tunnelPubkey, tunnelListen,
 	tunnelBinary, tunnelProfile, scanDomain, scanInterval string,
-	scanMinScore, scanTop, scanWorkers int) {
+	scanTop, scanWorkers int) {
 
 	// If tunnel-profile is a file path, read the URI from it
 	if tunnelProfile != "" && !strings.HasPrefix(tunnelProfile, "slipnet://") {
@@ -369,7 +370,7 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 	fmt.Printf("  DNS proxy:     %s\n", listen)
 	fmt.Printf("  Upstream:      %s (%d resolvers)\n", modeStr, len(parsed))
 	fmt.Printf("  Scan interval: %s\n", interval)
-	fmt.Printf("  Min score:     %d/6\n", scanMinScore)
+	fmt.Printf("  Scan mode:     verify (HMAC challenge-response)\n")
 	fmt.Printf("  Top N:         %d\n", scanTop)
 	fmt.Printf("  Scan workers:  %d\n", scanWorkers)
 	fmt.Println()
@@ -432,9 +433,25 @@ func runTunnelMode(parsed []Resolver, doh bool, mode, listen string, tcp, cacheE
 		}()
 	}
 
-	// Start auto-scanner (initial scan is synchronous — blocks until done)
-	autoScanner := NewAutoScanner(pool, parsed, scanDomain, doh, interval, scanMinScore, scanTop, scanWorkers)
+	// Decode pubkey for HMAC verify scanner
+	pubkeyBytes, err := hex.DecodeString(tunnelPubkey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid public key hex for verify scanner: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Start auto-scanner: shuffles resolvers, scans up to 5000 per round using
+	// HMAC challenge-response verification, signals ready once topN verified.
+	autoScanner := NewAutoScanner(pool, parsed, scanDomain, doh, pubkeyBytes, interval, scanTop, 5000, scanWorkers)
 	autoScanner.Start()
+
+	slog.Info("Scanning DNS resolvers, tunnel will start once enough are found...")
+	autoScanner.WaitReady()
+
+	// When a resolver goes down, trigger a rescan to find a replacement
+	pool.SetOnResolverDown(func() {
+		autoScanner.TriggerRescan()
+	})
 
 	// Start tunnel client (pointed at the multiplexer's DNS proxy)
 	tunnelCfg := TunnelConfig{

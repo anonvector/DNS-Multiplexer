@@ -32,15 +32,16 @@ type resolverStats struct {
 
 // ResolverPool manages a set of upstream resolvers with health tracking.
 type ResolverPool struct {
-	resolvers    []Resolver
-	mode         string // "round-robin" or "random"
-	doh          bool
-	mu           sync.RWMutex
-	healthy      map[Resolver]bool
-	healthyCache []Resolver
-	stats        map[Resolver]*resolverStats
-	failStreak   map[Resolver]int
-	rrIndex      uint64
+	resolvers      []Resolver
+	mode           string // "round-robin" or "random"
+	doh            bool
+	mu             sync.RWMutex
+	healthy        map[Resolver]bool
+	healthyCache   []Resolver
+	stats          map[Resolver]*resolverStats
+	failStreak     map[Resolver]int
+	rrIndex        uint64
+	onResolverDown func() // called (in a goroutine) when a resolver is marked unhealthy
 }
 
 func NewResolverPool(resolvers []Resolver, mode string, doh bool) *ResolverPool {
@@ -116,14 +117,30 @@ func (p *ResolverPool) MarkSuccess(r Resolver) {
 
 func (p *ResolverPool) MarkFailure(r Resolver) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	s := p.stats[r]
 	atomic.AddUint64(&s.fail, 1)
 	p.failStreak[r]++
-	if p.failStreak[r] >= 3 && p.healthy[r] {
+	// Generous threshold: during internet shutdowns DNS servers fail temporarily
+	// but may come back, so we allow many consecutive failures before marking down.
+	var cb func()
+	if p.failStreak[r] >= 10 && p.healthy[r] {
 		p.healthy[r] = false
 		p.rebuildHealthyCache()
+		cb = p.onResolverDown
+		slog.Warn("Resolver marked unhealthy", "resolver", r, "streak", p.failStreak[r])
 	}
+	p.mu.Unlock()
+	if cb != nil {
+		go cb()
+	}
+}
+
+// SetOnResolverDown registers a callback invoked (in a new goroutine) whenever
+// a resolver is marked unhealthy. Used by AutoScanner to trigger rescanning.
+func (p *ResolverPool) SetOnResolverDown(fn func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onResolverDown = fn
 }
 
 func (p *ResolverPool) HealthCheck() {
